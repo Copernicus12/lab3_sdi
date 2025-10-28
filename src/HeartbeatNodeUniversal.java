@@ -4,21 +4,23 @@ import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-public class HeartbeatNode {
-    private static final int HEARTBEAT_PORT = 8888;
-    private static final int MESSAGE_PORT = 8889;
-    private static final int MULTICAST_PORT = 8890;
+public class HeartbeatNodeUniversal {
+    private static final int BASE_HEARTBEAT_PORT = 18888;
+    private static final int BASE_MESSAGE_PORT = 18889;
+    private static final int MULTICAST_PORT = 18990;
     private static final String MULTICAST_GROUP = "230.0.0.1";
     private static final long HEARTBEAT_INTERVAL = 3000;
     private static final long TIMEOUT_THRESHOLD = 10000;
 
     private String nodeId;
+    private int nodeIndex;
+    private int heartbeatPort;
+    private int messagePort;
     private Map<String, NodeInfo> nodes;
     private AtomicBoolean running;
     private MulticastSocket multicastSocket;
     private InetAddress multicastGroup;
-    private ServerSocket messageServerSocket;
-    private int actualMessagePort;
+    private InetAddress localAddress;
 
     private class NodeInfo {
         String nodeId;
@@ -36,47 +38,36 @@ public class HeartbeatNode {
         }
     }
 
-    public HeartbeatNode(String nodeId) {
+    public HeartbeatNodeUniversal(String nodeId, int nodeIndex) {
         this.nodeId = nodeId;
+        this.nodeIndex = nodeIndex;
+        this.heartbeatPort = BASE_HEARTBEAT_PORT + nodeIndex;
+        this.messagePort = BASE_MESSAGE_PORT + nodeIndex;
         this.nodes = new ConcurrentHashMap<>();
         this.running = new AtomicBoolean(true);
-        this.actualMessagePort = MESSAGE_PORT;
 
         try {
+            this.localAddress = InetAddress.getLocalHost();
             this.multicastGroup = InetAddress.getByName(MULTICAST_GROUP);
             this.multicastSocket = new MulticastSocket(MULTICAST_PORT);
             this.multicastSocket.joinGroup(multicastGroup);
-
-            // Încearcă să pornească serverul pe portul principal
-            try {
-                this.messageServerSocket = new ServerSocket(MESSAGE_PORT);
-                this.actualMessagePort = MESSAGE_PORT;
-            } catch (IOException e) {
-                // Dacă portul este ocupat, găsește un port liber automat
-                this.messageServerSocket = new ServerSocket(0); // Port liber
-                this.actualMessagePort = messageServerSocket.getLocalPort();
-                System.out.println("Note: Message port " + MESSAGE_PORT + " was busy, using port " + actualMessagePort);
-            }
         } catch (IOException e) {
             System.err.println("Error initializing node: " + e.getMessage());
-            System.exit(1);
         }
     }
 
     public void start() {
         System.out.println("=== HEARTBEAT NODE " + nodeId + " ===");
-        try {
-            System.out.println("Local Address: " + InetAddress.getLocalHost().getHostAddress());
-        } catch (UnknownHostException e) {
-            System.out.println("Local Address: Unknown");
-        }
-        System.out.println("Message Port: " + actualMessagePort);
+        System.out.println("Local Address: " + localAddress.getHostAddress());
+        System.out.println("Heartbeat Port: " + heartbeatPort);
+        System.out.println("Message Port: " + messagePort);
         System.out.println("Multicast Group: " + MULTICAST_GROUP + ":" + MULTICAST_PORT);
         System.out.println("Commands: 'send <nodeId> <message>', 'list', 'quit', 'help'");
         System.out.println("----------------------------------------");
 
         new Thread(this::startMulticastSender).start();
         new Thread(this::startMulticastReceiver).start();
+        new Thread(this::startHeartbeatReceiver).start();
         new Thread(this::startMessageServer).start();
         new Thread(this::startMonitor).start();
         startConsoleReader();
@@ -85,8 +76,8 @@ public class HeartbeatNode {
     private void startMulticastSender() {
         try {
             while (running.get()) {
-                // Trimite informații despre nod prin multicast
-                String multicastMsg = "HEARTBEAT:" + nodeId + ":" + actualMessagePort;
+                // Trimite informații complete despre nod prin multicast
+                String multicastMsg = "HEARTBEAT:" + nodeId + ":" + messagePort + ":" + heartbeatPort;
                 byte[] buffer = multicastMsg.getBytes();
                 DatagramPacket packet = new DatagramPacket(
                         buffer, buffer.length, multicastGroup, MULTICAST_PORT
@@ -125,40 +116,84 @@ public class HeartbeatNode {
         }
     }
 
-    private void processMulticastMessage(String message, InetAddress sourceAddress) {
-        if (message.startsWith("HEARTBEAT:")) {
-            String[] parts = message.split(":");
-            if (parts.length >= 3) {
-                String sourceNode = parts[1];
-                int sourceMessagePort = Integer.parseInt(parts[2]);
-
-                // Verifică dacă nu este același nod (prin adresă sau port)
-                boolean isSameNode = sourceNode.equals(nodeId) &&
-                        sourceAddress.equals(multicastGroup);
-
-                if (!isSameNode) {
-                    updateNodeStatus(sourceNode, sourceAddress, sourceMessagePort);
-                }
-            }
-        }
-    }
-
-    private void startMessageServer() {
-        try {
-            messageServerSocket.setSoTimeout(1000);
+    private void startHeartbeatReceiver() {
+        try (DatagramSocket socket = new DatagramSocket(heartbeatPort)) {
+            byte[] buffer = new byte[1024];
 
             while (running.get()) {
+                DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
+                socket.setSoTimeout(1000);
+
                 try {
-                    Socket clientSocket = messageServerSocket.accept();
-                    new Thread(() -> handleMessage(clientSocket)).start();
+                    socket.receive(packet);
+                    String message = new String(packet.getData(), 0, packet.getLength());
+
+                    if (message.startsWith("HEARTBEAT:")) {
+                        String[] parts = message.split(":");
+                        if (parts.length >= 3) {
+                            String sourceNode = parts[1];
+                            int sourceMessagePort = Integer.parseInt(parts[2]);
+                            updateNodeStatus(sourceNode, packet.getAddress(), sourceMessagePort);
+                        }
+                    }
                 } catch (SocketTimeoutException e) {
                     // Continue checking
                 }
             }
         } catch (IOException e) {
             if (running.get()) {
-                System.err.println("Message server error: " + e.getMessage());
+                System.err.println("Heartbeat receiver error: " + e.getMessage());
             }
+        }
+    }
+
+    private void processMulticastMessage(String message, InetAddress sourceAddress) {
+        if (message.startsWith("HEARTBEAT:")) {
+            String[] parts = message.split(":");
+            if (parts.length >= 4) {
+                String sourceNode = parts[1];
+                int sourceMessagePort = Integer.parseInt(parts[2]);
+                int sourceHeartbeatPort = Integer.parseInt(parts[3]);
+
+                // Verifică dacă nu este același nod
+                if (!sourceNode.equals(nodeId) || !sourceAddress.equals(localAddress)) {
+                    updateNodeStatus(sourceNode, sourceAddress, sourceMessagePort);
+
+                    // Trimite un heartbeat direct ca răspuns
+                    sendDirectHeartbeat(sourceAddress, sourceHeartbeatPort);
+                }
+            }
+        }
+    }
+
+    private void sendDirectHeartbeat(InetAddress targetAddress, int targetHeartbeatPort) {
+        try (DatagramSocket socket = new DatagramSocket()) {
+            String heartbeatMsg = "HEARTBEAT:" + nodeId + ":" + messagePort;
+            byte[] buffer = heartbeatMsg.getBytes();
+            DatagramPacket packet = new DatagramPacket(
+                    buffer, buffer.length, targetAddress, targetHeartbeatPort
+            );
+            socket.send(packet);
+        } catch (IOException e) {
+            // Ignore occasional errors
+        }
+    }
+
+    private void startMessageServer() {
+        try (ServerSocket serverSocket = new ServerSocket(messagePort)) {
+            serverSocket.setSoTimeout(1000);
+
+            while (running.get()) {
+                try {
+                    Socket clientSocket = serverSocket.accept();
+                    new Thread(() -> handleMessage(clientSocket)).start();
+                } catch (SocketTimeoutException e) {
+                    // Continue checking
+                }
+            }
+        } catch (IOException e) {
+            System.err.println("Message server error on port " + messagePort + ": " + e.getMessage());
+            System.exit(1);
         }
     }
 
@@ -261,36 +296,27 @@ public class HeartbeatNode {
         String targetNode = parts[0];
         String message = parts[1];
 
-        // Găsește toate nodurile cu ID-ul respectiv
-        List<NodeInfo> targetNodes = new ArrayList<>();
+        // Găsește primul nod cu ID-ul respectiv
+        NodeInfo targetInfo = null;
         for (NodeInfo info : nodes.values()) {
             if (info.nodeId.equals(targetNode)) {
-                targetNodes.add(info);
+                targetInfo = info;
+                break;
             }
         }
 
-        if (targetNodes.isEmpty()) {
+        if (targetInfo == null) {
             System.out.println("Node " + targetNode + " not found or offline");
             return;
         }
 
-        // Încearcă să trimită mesajul la primul nod online
-        boolean sent = false;
-        for (NodeInfo targetInfo : targetNodes) {
-            try (Socket socket = new Socket(targetInfo.address, targetInfo.messagePort);
-                 PrintWriter writer = new PrintWriter(socket.getOutputStream(), true)) {
+        try (Socket socket = new Socket(targetInfo.address, targetInfo.messagePort);
+             PrintWriter writer = new PrintWriter(socket.getOutputStream(), true)) {
 
-                writer.println("From " + nodeId + ": " + message);
-                System.out.println("Message sent to " + targetNode + " (" + targetInfo.address.getHostAddress() + ")");
-                sent = true;
-                break;
-            } catch (IOException e) {
-                // Continue to next node
-            }
-        }
-
-        if (!sent) {
-            System.out.println("Failed to send message to " + targetNode + " - all nodes unreachable");
+            writer.println("From " + nodeId + ": " + message);
+            System.out.println("Message sent to " + targetNode);
+        } catch (IOException e) {
+            System.out.println("Failed to send message to " + targetNode + ": " + e.getMessage());
         }
     }
 
@@ -313,9 +339,9 @@ public class HeartbeatNode {
 
                 for (NodeInfo info : instances) {
                     String status = (currentTime - info.lastSeen < TIMEOUT_THRESHOLD) ? "ONLINE" : "OFFLINE";
-                    String location = info.address.isAnyLocalAddress() ? "local" : info.address.getHostAddress();
                     System.out.printf("%s - %s (%s:%d) - Last seen: %dms ago%n",
-                            nodeId, status, location, info.messagePort, currentTime - info.lastSeen);
+                            nodeId, status, info.address.getHostAddress(), info.messagePort,
+                            currentTime - info.lastSeen);
                 }
             }
         }
@@ -341,34 +367,28 @@ public class HeartbeatNode {
                 // Ignore close errors
             }
         }
-        if (messageServerSocket != null) {
-            try {
-                messageServerSocket.close();
-            } catch (IOException e) {
-                // Ignore close errors
-            }
-        }
         System.out.println("Heartbeat node " + nodeId + " stopped.");
     }
 
     public static void main(String[] args) {
-        if (args.length < 1) {
-            System.out.println("Usage: java HeartbeatNode <nodeId>");
+        if (args.length < 2) {
+            System.out.println("Usage: java HeartbeatNodeUniversal <nodeId> <nodeIndex>");
             System.out.println("Examples:");
-            System.out.println("  On same computer:");
-            System.out.println("    Terminal 1: java HeartbeatNode node1");
-            System.out.println("    Terminal 2: java HeartbeatNode node2");
-            System.out.println("    Terminal 3: java HeartbeatNode node3");
-            System.out.println("  On different computers:");
-            System.out.println("    Computer 1: java HeartbeatNode node1");
-            System.out.println("    Computer 2: java HeartbeatNode node2");
-            System.out.println("    Computer 3: java HeartbeatNode node3");
+            System.out.println("  For local testing (multiple instances on same PC):");
+            System.out.println("    java HeartbeatNodeUniversal node1 0");
+            System.out.println("    java HeartbeatNodeUniversal node2 1");
+            System.out.println("    java HeartbeatNodeUniversal node3 2");
+            System.out.println("  For network testing (each on different PC):");
+            System.out.println("    java HeartbeatNodeUniversal node1 0");
+            System.out.println("    java HeartbeatNodeUniversal node2 0");
+            System.out.println("    java HeartbeatNodeUniversal node3 0");
             return;
         }
 
         String nodeId = args[0];
+        int nodeIndex = Integer.parseInt(args[1]);
 
-        HeartbeatNode node = new HeartbeatNode(nodeId);
+        HeartbeatNodeUniversal node = new HeartbeatNodeUniversal(nodeId, nodeIndex);
 
         Runtime.getRuntime().addShutdownHook(new Thread(node::stop));
 
